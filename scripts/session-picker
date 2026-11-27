@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Telescope-style tmux session picker (fzf).
+# Works outside tmux (new iTerm tab: attaches) and inside tmux (switches client).
+#   enter   open the selected session/window, or create a session named after the query
+#   ctrl-o  new window in the selected session
+#   ctrl-x  kill the selected session/window (asks y/N first)
+#   esc     cancel (outside tmux: drop to a plain shell)
+# With no sessions yet, enter on an empty query creates "main".
+
+self="$0"
+# popups/iTerm commands may start without Homebrew on PATH
+PATH="/opt/homebrew/bin:$PATH"
+
+list_sessions() {
+  # One line per session (most recently used first), followed by one line per
+  # window when the session has more than one. Format: "session:window:display"
+  # (':' is safe as a separator, tmux forbids it in session names; window is
+  # empty on session lines). Display = pane title, e.g. the Claude task name.
+  local windows
+  windows=$(tmux -u list-windows -a -F '#{session_name}:#{window_index}:#{window_active}:#{?#{==:#{pane_title},#{host}},#{window_name},#{pane_title}}' 2>/dev/null)
+  tmux -u list-sessions -F '#{session_last_attached}:#{session_name}:#{session_windows}:#{session_attached}' 2>/dev/null \
+    | sort -t: -k1,1 -rn \
+    | while IFS=: read -r _ name count attached; do
+        local title extra=""
+        title=$(awk -F: -v s="$name" '$1 == s && $3 == 1 { sub(/^([^:]*:){3}/, ""); print; exit }' <<<"$windows")
+        (( count > 1 )) && extra="  · ${count} windows"
+        (( attached > 0 )) && extra="$extra  (attached)"
+        printf '%s::  %s%s\n' "$name" "$title" "$extra"
+        if (( count > 1 )); then
+          awk -F: -v s="$name" '$1 == s {
+              idx = $2; active = $3; sub(/^([^:]*:){3}/, "")
+              printf "%s:%s:    └ %s  %s%s\n", s, idx, idx, $0, (active == 1 ? "  *" : "")
+            }' <<<"$windows"
+        fi
+      done
+}
+
+# Subcommands used by fzf bindings (fzf runs them via $SHELL, i.e. zsh, where a
+# leading '=' means something else, so the tmux calls live here in bash).
+case $1 in
+  --list)    list_sessions; exit 0 ;;
+  --preview) tmux capture-pane -ep -t "=$2:$3" 2>/dev/null; exit 0 ;;
+  --new-window)
+    # new window in the selected session (in its active pane's directory), then go there
+    dir=$(tmux display -p -t "=$2:" '#{pane_current_path}' 2>/dev/null)
+    win=$(tmux new-window -d -P -F '#{window_index}' -t "=$2:" -c "${dir:-$HOME}") || exit 1
+    if [[ -n $TMUX ]]; then tmux switch-client -t "=$2:$win"; else tmux attach-session -t "=$2:$win"; fi
+    exit 0 ;;
+  --kill)
+    # always confirm; reads from the terminal since fzf hands it over in execute()
+    if [[ -n $3 ]]; then what="window $3 of \"$2\""; else what="session \"$2\""; fi
+    printf '\n  Kill %s? [y/N] ' "$what"
+    read -rn1 answer </dev/tty
+    if [[ $answer == [yY] ]]; then
+      if [[ -n $3 ]]; then tmux kill-window -t "=$2:$3"; else tmux kill-session -t "=$2"; fi
+    fi
+    exit 0 ;;
+esac
+
+sessions=$(list_sessions)
+esc='plain shell'; [[ -n $TMUX ]] && esc='close'
+header="⏎ open/new · ^o new window · ^x kill · esc $esc"
+[[ -z $sessions ]] && header="no sessions · type a name ⏎ (empty = main) · esc $esc"
+
+out=$(printf '%s' "$sessions" | fzf \
+  --print-query \
+  --delimiter ':' --with-nth '1,3..' \
+  --layout reverse --border rounded --height 100% \
+  --border-label ' Sessions ' --prompt '  ' --pointer '▶' \
+  --header "$header" \
+  --preview "$self --preview {1} {2}" \
+  --preview-window 'right,60%,border-left' \
+  --bind "ctrl-o:become($self --new-window {1})" \
+  --bind "ctrl-x:execute($self --kill {1} {2})+reload($self --list)" \
+  --color 'bg+:#292e42,fg+:#c0caf5,hl:#7aa2f7,hl+:#7aa2f7,prompt:#7aa2f7,pointer:#e0af68,info:#565f89,border:#565f89,header:#565f89,label:#7aa2f7')
+status=$?
+
+# 130 = esc / ctrl-c
+[[ $status == 130 ]] && exit 1
+
+query=$(sed -n 1p <<<"$out")
+selected=$(sed -n 2p <<<"$out")
+window=$(cut -d: -f2 <<<"$selected")
+selected=$(cut -d: -f1 <<<"$selected")
+
+if [[ -n $selected ]]; then
+  name=$selected
+else
+  # tmux session names can't contain '.' or ':'
+  name=$(tr '.:' '__' <<<"$query")
+  # nothing typed: default to "main" when there are no sessions at all
+  [[ -z $name && -z $sessions ]] && name=main
+  [[ -z $name ]] && exit 1
+  tmux new-session -d -s "$name" -c "$HOME"
+fi
+
+target="=$name"
+[[ -n $window ]] && target="=$name:$window"
+
+if [[ -n $TMUX ]]; then
+  tmux switch-client -t "$target"
+else
+  tmux attach-session -t "$target"
+fi
